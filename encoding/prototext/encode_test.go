@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/internal/flags"
 	"google.golang.org/protobuf/internal/protobuild"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/testing/protopack"
 
@@ -1620,5 +1621,47 @@ func TestMarshalAppendAllocations(t *testing.T) {
 		t.Errorf("%v allocs/op when writing to a preallocated buffer", marshalAllocs)
 		t.Errorf("%v allocs/op when repeatedly appending to a slice", marshalAppendAllocs)
 		t.Errorf("expect amortized allocs/op to be identical")
+	}
+}
+
+type indexEncoder struct {
+	*prototext.Encoder
+}
+
+func (e *indexEncoder) SetBase(base *prototext.Encoder) {
+	e.Encoder = base
+}
+
+func (e *indexEncoder) MarshalList(name string, list protoreflect.List, fd protoreflect.FieldDescriptor) error {
+	e.WriteName(name)
+	size := list.Len()
+	for i := range size {
+		e.WriteLiteral(" ")
+		e.WriteInt(int64(i))
+		e.WriteLiteral(":")
+		if err := e.MarshalSingular(list.Get(i), fd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestCustomEncoder(t *testing.T) {
+	mo := prototext.MarshalOptions{
+		CustomedEncoder: &indexEncoder{},
+		Override: prototext.EncoderOverride{
+			HasMarshalList: true,
+		},
+	}
+	b, err := mo.Marshal(&pb3.Repeats{
+		RptString: []string{"a", "b", "c"},
+	})
+	if err != nil {
+		t.Error(err)
+	}
+	want := `rpt_string: 0:"a" 1:"b" 2:"c"`
+	got := string(b)
+	if got != want {
+		t.Errorf("Marshal()\n<got>\n%s\n<want>\n%s\n", got, want)
 	}
 }

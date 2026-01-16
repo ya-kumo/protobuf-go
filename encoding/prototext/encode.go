@@ -82,6 +82,9 @@ type MarshalOptions struct {
 		protoregistry.ExtensionTypeResolver
 		protoregistry.MessageTypeResolver
 	}
+
+	CustomedEncoder EncoderDelegate
+	Override        EncoderOverride
 }
 
 // Format formats the message as a string.
@@ -118,7 +121,7 @@ func (o MarshalOptions) MarshalAppend(b []byte, m proto.Message) ([]byte, error)
 // For profiling purposes, avoid changing the name of this function or
 // introducing other code paths for marshal that do not go through this.
 func (o MarshalOptions) marshal(b []byte, m proto.Message) ([]byte, error) {
-	var delims = [2]byte{'{', '}'}
+	delims := [2]byte{'{', '}'}
 
 	if o.Multiline && o.Indent == "" {
 		o.Indent = defaultIndent
@@ -138,8 +141,21 @@ func (o MarshalOptions) marshal(b []byte, m proto.Message) ([]byte, error) {
 		return b, nil
 	}
 
-	enc := encoder{internalEnc, o}
-	err = enc.marshalMessage(m.ProtoReflect(), false)
+	baseEnc := &Encoder{
+		Encoder:  internalEnc,
+		opts:     o,
+		delegate: nil,
+		override: EncoderOverride{},
+	}
+	enc := o.CustomedEncoder
+	if enc == nil {
+		enc = baseEnc
+	} else {
+		baseEnc.delegate = o.CustomedEncoder
+		baseEnc.override = o.Override
+		enc.SetBase(baseEnc)
+	}
+	err = enc.MarshalMessage(m.ProtoReflect(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -153,13 +169,78 @@ func (o MarshalOptions) marshal(b []byte, m proto.Message) ([]byte, error) {
 	return out, proto.CheckInitialized(m)
 }
 
-type encoder struct {
-	*text.Encoder
-	opts MarshalOptions
+// EncoderOverride defines which overrode methods should be used.
+type EncoderOverride struct {
+	// HasMarshalMessage indicates whether [EncoderDelegate.MarshalMessage] should be used.
+	HasMarshalMessage bool
+
+	// HasMarshalField indicates whether [EncoderDelegate.MarshalField] should be used.
+	HasMarshalField bool
+
+	// HasMarshalSingular indicates whether [EncoderDelegate.MarshalSingular] should be used.
+	HasMarshalSingular bool
+
+	// HasMarshalList indicates whether [EncoderDelegate.MarshalList] should be used.
+	HasMarshalList bool
+
+	// HasMarshalMap indicates whether [EncoderDelegate.MarshalMap] should be used.
+	HasMarshalMap bool
+
+	// HasMarshalUnknown indicates whether [EncoderDelegate.MarshalUnknown] should be used.
+	HasMarshalUnknown bool
+
+	// HasMarshalAny indicates whether [EncoderDelegate.MarshalAny] should be used.
+	HasMarshalAny bool
 }
 
-// marshalMessage marshals the given protoreflect.Message.
-func (e encoder) marshalMessage(m protoreflect.Message, inclDelims bool) error {
+// EncoderDelegate defines the overrideable methods of [Encoder].
+// Besides implementing override methods, a struct [EncoderOverride] is also required
+// to make it usable.
+type EncoderDelegate interface {
+	// SetBase will be called with the default [Encoder], makes it easier to inherit
+	// default behaviors.
+	SetBase(*Encoder)
+
+	// MarshalMessage can override [Encoder.MarshalMessage].
+	MarshalMessage(m protoreflect.Message, inclDelims bool) error
+
+	// MarshalField can override [Encoder.MarshalField].
+	MarshalField(name string, val protoreflect.Value, fd protoreflect.FieldDescriptor) error
+
+	// MarshalField can override [Encoder.MarshalSingular].
+	MarshalSingular(val protoreflect.Value, fd protoreflect.FieldDescriptor) error
+
+	// MarshalField can override [Encoder.MarshalList].
+	MarshalList(name string, list protoreflect.List, fd protoreflect.FieldDescriptor) error
+
+	// MarshalField can override [Encoder.MarshalMap].
+	MarshalMap(name string, mmap protoreflect.Map, fd protoreflect.FieldDescriptor) error
+
+	// MarshalField can override [Encoder.MarshalUnknown].
+	MarshalUnknown(b []byte)
+
+	// MarshalField can override [Encoder.MarshalAny].
+	MarshalAny(m protoreflect.Message) bool
+
+	// Bytes is called by [MarshalOptions] and should not be overridden if [Encoder] is embedded.
+	Bytes() []byte
+}
+
+// Encoder became public for customization.
+type Encoder struct {
+	*text.Encoder
+
+	opts     MarshalOptions
+	delegate EncoderDelegate
+	override EncoderOverride
+}
+
+func (e *Encoder) SetBase(_ *Encoder) {
+	panic("should not set base in base, consider define SetBase method in your struct")
+}
+
+// MarshalMessage marshals the given protoreflect.Message.
+func (e *Encoder) MarshalMessage(m protoreflect.Message, inclDelims bool) error {
 	messageDesc := m.Descriptor()
 	if !flags.ProtoLegacy && messageset.IsMessageSet(messageDesc) {
 		return errors.New("no support for proto1 MessageSets")
@@ -198,8 +279,8 @@ func (e encoder) marshalMessage(m protoreflect.Message, inclDelims bool) error {
 	return nil
 }
 
-// marshalField marshals the given field with protoreflect.Value.
-func (e encoder) marshalField(name string, val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
+// MarshalField marshals the given field with protoreflect.Value.
+func (e *Encoder) MarshalField(name string, val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
 	switch {
 	case fd.IsList():
 		return e.marshalList(name, val.List(), fd)
@@ -211,9 +292,9 @@ func (e encoder) marshalField(name string, val protoreflect.Value, fd protorefle
 	}
 }
 
-// marshalSingular marshals the given non-repeated field value. This includes
+// MarshalSingular marshals the given non-repeated field value. This includes
 // all scalar types, enums, messages, and groups.
-func (e encoder) marshalSingular(val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
+func (e *Encoder) MarshalSingular(val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
 	kind := fd.Kind()
 	switch kind {
 	case protoreflect.BoolKind:
@@ -264,10 +345,10 @@ func (e encoder) marshalSingular(val protoreflect.Value, fd protoreflect.FieldDe
 	return nil
 }
 
-// marshalList marshals the given protoreflect.List as multiple name-value fields.
-func (e encoder) marshalList(name string, list protoreflect.List, fd protoreflect.FieldDescriptor) error {
+// MarshalList marshals the given protoreflect.List as multiple name-value fields.
+func (e *Encoder) MarshalList(name string, list protoreflect.List, fd protoreflect.FieldDescriptor) error {
 	size := list.Len()
-	for i := 0; i < size; i++ {
+	for i := range size {
 		e.WriteName(name)
 		if err := e.marshalSingular(list.Get(i), fd); err != nil {
 			return err
@@ -276,8 +357,8 @@ func (e encoder) marshalList(name string, list protoreflect.List, fd protoreflec
 	return nil
 }
 
-// marshalMap marshals the given protoreflect.Map as multiple name-value fields.
-func (e encoder) marshalMap(name string, mmap protoreflect.Map, fd protoreflect.FieldDescriptor) error {
+// MarshalMap marshals the given protoreflect.Map as multiple name-value fields.
+func (e *Encoder) MarshalMap(name string, mmap protoreflect.Map, fd protoreflect.FieldDescriptor) error {
 	var err error
 	order.RangeEntries(mmap, order.GenericKeyOrder, func(key protoreflect.MapKey, val protoreflect.Value) bool {
 		e.WriteName(name)
@@ -292,17 +373,14 @@ func (e encoder) marshalMap(name string, mmap protoreflect.Map, fd protoreflect.
 
 		e.WriteName(string(genid.MapEntry_Value_field_name))
 		err = e.marshalSingular(val, fd.MapValue())
-		if err != nil {
-			return false
-		}
-		return true
+		return err == nil
 	})
 	return err
 }
 
-// marshalUnknown parses the given []byte and marshals fields out.
+// MarshalUnknown parses the given []byte and marshals fields out.
 // This function assumes proper encoding in the given []byte.
-func (e encoder) marshalUnknown(b []byte) {
+func (e *Encoder) MarshalUnknown(b []byte) {
 	const dec = 10
 	const hex = 16
 	for len(b) > 0 {
@@ -341,13 +419,13 @@ func (e encoder) marshalUnknown(b []byte) {
 	}
 }
 
-// marshalAny marshals the given google.protobuf.Any message in expanded form.
+// MarshalAny marshals the given google.protobuf.Any message in expanded form.
 // It returns true if it was able to marshal, else false.
-func (e encoder) marshalAny(any protoreflect.Message) bool {
+func (e *Encoder) MarshalAny(msg protoreflect.Message) bool {
 	// Construct the embedded message.
-	fds := any.Descriptor().Fields()
+	fds := msg.Descriptor().Fields()
 	fdType := fds.ByNumber(genid.Any_TypeUrl_field_number)
-	typeURL := any.Get(fdType).String()
+	typeURL := msg.Get(fdType).String()
 	mt, err := e.opts.Resolver.FindMessageByURL(typeURL)
 	if err != nil {
 		return false
@@ -356,7 +434,7 @@ func (e encoder) marshalAny(any protoreflect.Message) bool {
 
 	// Unmarshal bytes into embedded message.
 	fdValue := fds.ByNumber(genid.Any_Value_field_number)
-	value := any.Get(fdValue)
+	value := msg.Get(fdValue)
 	err = proto.UnmarshalOptions{
 		AllowPartial: true,
 		Resolver:     e.opts.Resolver,
@@ -377,4 +455,53 @@ func (e encoder) marshalAny(any protoreflect.Message) bool {
 		return false
 	}
 	return true
+}
+
+func (e *Encoder) marshalMessage(m protoreflect.Message, inclDelims bool) error {
+	if e.override.HasMarshalMessage {
+		return e.delegate.MarshalMessage(m, inclDelims)
+	}
+	return e.MarshalMessage(m, inclDelims)
+}
+
+func (e *Encoder) marshalField(name string, val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
+	if e.override.HasMarshalField {
+		return e.delegate.MarshalField(name, val, fd)
+	}
+	return e.MarshalField(name, val, fd)
+}
+
+func (e *Encoder) marshalSingular(val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
+	if e.override.HasMarshalSingular {
+		return e.delegate.MarshalSingular(val, fd)
+	}
+	return e.MarshalSingular(val, fd)
+}
+
+func (e *Encoder) marshalList(name string, list protoreflect.List, fd protoreflect.FieldDescriptor) error {
+	if e.override.HasMarshalList {
+		return e.delegate.MarshalList(name, list, fd)
+	}
+	return e.MarshalList(name, list, fd)
+}
+
+func (e *Encoder) marshalMap(name string, mmap protoreflect.Map, fd protoreflect.FieldDescriptor) error {
+	if e.override.HasMarshalMap {
+		return e.delegate.MarshalMap(name, mmap, fd)
+	}
+	return e.MarshalMap(name, mmap, fd)
+}
+
+func (e *Encoder) marshalUnknown(b []byte) {
+	if e.override.HasMarshalUnknown {
+		e.delegate.MarshalUnknown(b)
+	}
+	e.MarshalUnknown(b)
+}
+
+func (e *Encoder) marshalAny(m protoreflect.Message) bool {
+	if e.override.HasMarshalAny {
+		return e.delegate.MarshalAny(m)
+	}
+	return e.MarshalAny(m)
 }
